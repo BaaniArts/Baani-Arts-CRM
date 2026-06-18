@@ -1067,24 +1067,50 @@ async function manualSync() {
   else { showToast('⚠️ Internet check karo — sync nahi hua'); }
 }
 
-const SHEET_URL = 'https://script.google.com/macros/s/AKfycbywJ-3tSTtBM0iQmH4IS7OtkM1UkA07lOhRNreTGFbtfCu3cSOQA7Ekc-1qdjhvc2n7og/exec';
+const SHEET_URL = 'https://script.google.com/macros/s/AKfycbz3Mbe4s2Wax5CbgMyNck1k_Etqf7dS74YkEQWzISj6qPgmbBr05rKXAmcMNZGoUd1f/exec';
 let syncStatus = 'idle'; // idle, syncing, ok, error
 
 async function syncFromSheet() {
   try {
     setSyncUI('syncing');
-    const res = await fetch(SHEET_URL + '?action=getAll', {mode:'cors'});
+    const res = await fetch(SHEET_URL + '?action=getAll&t=' + Date.now(), {mode:'cors', cache:'no-store'});
     const data = await res.json();
     if(data.status === 'ok' && data.leads) {
-      // Merge: sheet data wins for server records, local wins for new unsaved
-      const sheetIds = new Set(data.leads.map(l=>l.id));
-      const localOnly = leads.filter(l=>!sheetIds.has(l.id));
-      leads = [...data.leads, ...localOnly];
+      // Sheet is single source of truth
+      // Local leads jo sheet mein nahi hain — unhe bhi sheet mein push karo
+      const sheetIds = new Set(data.leads.map(l=>String(l.id)));
+      const localOnly = leads.filter(l=>!sheetIds.has(String(l.id)));
+      
+      // Local-only leads ko sheet mein save karo
+      for(const lead of localOnly) {
+        await syncToSheet(lead, false);
+      }
+      
+      // Ab fresh data lo
+      if(localOnly.length > 0) {
+        const res2 = await fetch(SHEET_URL + '?action=getAll&t=' + Date.now(), {mode:'cors', cache:'no-store'});
+        const data2 = await res2.json();
+        if(data2.status === 'ok') {
+          leads = data2.leads;
+        }
+      } else {
+        leads = data.leads;
+      }
+      
+      // Deduplicate by id (latest updatedAt wins)
+      const seen = {};
+      leads = leads.filter(l => {
+        const id = String(l.id);
+        if(!seen[id]) { seen[id] = true; return true; }
+        return false;
+      });
+      
       saveSt('ba_crm_leads', leads);
       setSyncUI('ok');
       return true;
     }
   } catch(e) {
+    console.error('Sync error:', e);
     setSyncUI('error');
   }
   return false;
@@ -1094,11 +1120,14 @@ async function syncToSheet(lead, isDelete) {
   try {
     const action = isDelete ? 'delete' : 'save';
     const params = isDelete
-      ? `action=delete&id=${lead.id}`
-      : `action=save&data=${encodeURIComponent(JSON.stringify(lead))}`;
-    await fetch(SHEET_URL + '?' + params, {mode:'cors'});
+      ? `action=delete&id=${lead.id}&t=${Date.now()}`
+      : `action=save&data=${encodeURIComponent(JSON.stringify(lead))}&t=${Date.now()}`;
+    const res = await fetch(SHEET_URL + '?' + params, {mode:'cors', cache:'no-store'});
+    const result = await res.json();
+    return result;
   } catch(e) {
     console.log('Sync error:', e);
+    return {status:'error'};
   }
 }
 
@@ -1145,11 +1174,17 @@ async function saveLead() {
   else leads=[lead,...leads];
   saveSt('ba_crm_leads',leads);
   closeModal();updateBadge();renderTab(currentTab);
-  showToast(editingId?'✅ Saved! Syncing...':'✅ Saved! Syncing...');
-  // Sync to sheet in background
-  syncToSheet(lead, false).then(()=>{
-    showToast('☁️ Google Sheet mein save ho gaya!');
-    setSyncUI('ok');
+  showToast('💾 Saving...');
+  setSyncUI('syncing');
+  // Sync to sheet
+  syncToSheet(lead, false).then(result => {
+    if(result && result.status === 'ok') {
+      showToast('☁️ Sab devices pe save ho gaya!');
+      setSyncUI('ok');
+    } else {
+      showToast('⚠️ Local save hua, Sheet sync baad mein hoga');
+      setSyncUI('error');
+    }
   });
 }
 
