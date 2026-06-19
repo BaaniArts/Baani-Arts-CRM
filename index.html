@@ -1060,76 +1060,16 @@ function copyText(){
 }
 
 // ── GOOGLE SHEETS SYNC ───────────────────────────────────────────────────────
-async function manualSync() {
-  showToast('☁️ Google Sheet se sync ho raha hai...');
-  const ok = await syncFromSheet();
-  if(ok){ renderTab(currentTab); showToast('✅ Data sync ho gaya! Sab devices update!'); }
-  else { showToast('⚠️ Internet check karo — sync nahi hua'); }
-}
-
-const SHEET_URL = 'https://script.google.com/macros/s/AKfycbz3Mbe4s2Wax5CbgMyNck1k_Etqf7dS74YkEQWzISj6qPgmbBr05rKXAmcMNZGoUd1f/exec';
-let syncStatus = 'idle'; // idle, syncing, ok, error
-
-async function syncFromSheet() {
-  try {
-    setSyncUI('syncing');
-    const res = await fetch(SHEET_URL + '?action=getAll&t=' + Date.now(), {mode:'cors', cache:'no-store'});
-    const data = await res.json();
-    if(data.status === 'ok' && data.leads) {
-      // Sheet is single source of truth
-      // Local leads jo sheet mein nahi hain — unhe bhi sheet mein push karo
-      const sheetIds = new Set(data.leads.map(l=>String(l.id)));
-      const localOnly = leads.filter(l=>!sheetIds.has(String(l.id)));
-      
-      // Local-only leads ko sheet mein save karo
-      for(const lead of localOnly) {
-        await syncToSheet(lead, false);
-      }
-      
-      // Ab fresh data lo
-      if(localOnly.length > 0) {
-        const res2 = await fetch(SHEET_URL + '?action=getAll&t=' + Date.now(), {mode:'cors', cache:'no-store'});
-        const data2 = await res2.json();
-        if(data2.status === 'ok') {
-          leads = data2.leads;
-        }
-      } else {
-        leads = data.leads;
-      }
-      
-      // Deduplicate by id (latest updatedAt wins)
-      const seen = {};
-      leads = leads.filter(l => {
-        const id = String(l.id);
-        if(!seen[id]) { seen[id] = true; return true; }
-        return false;
-      });
-      
-      saveSt('ba_crm_leads', leads);
-      setSyncUI('ok');
-      return true;
-    }
-  } catch(e) {
-    console.error('Sync error:', e);
-    setSyncUI('error');
-  }
-  return false;
-}
-
-async function syncToSheet(lead, isDelete) {
-  try {
-    const action = isDelete ? 'delete' : 'save';
-    const params = isDelete
-      ? `action=delete&id=${lead.id}&t=${Date.now()}`
-      : `action=save&data=${encodeURIComponent(JSON.stringify(lead))}&t=${Date.now()}`;
-    const res = await fetch(SHEET_URL + '?' + params, {mode:'cors', cache:'no-store'});
-    const result = await res.json();
-    return result;
-  } catch(e) {
-    console.log('Sync error:', e);
-    return {status:'error'};
-  }
-}
+// ── SUPABASE SYNC (Real-time database across all devices) ───────────────────
+const SUPA_URL = 'https://xfxkpbuxhwssixgjixtf.supabase.co';
+const SUPA_KEY = 'sb_publishable_w06UHEhss0hEeX1Hji4g5w_lybedz3j';
+const SUPA_HEADERS = {
+  'apikey': SUPA_KEY,
+  'Authorization': 'Bearer ' + SUPA_KEY,
+  'Content-Type': 'application/json',
+  'Prefer': 'return=minimal'
+};
+let syncStatus = 'idle';
 
 function setSyncUI(status) {
   syncStatus = status;
@@ -1141,10 +1081,125 @@ function setSyncUI(status) {
   else el.innerHTML = '';
 }
 
-// Override saveLead to also sync
-const _origSaveLead = saveLead;
+function leadToRow(lead) {
+  return {
+    id: String(lead.id),
+    name: lead.name||'',
+    company: lead.company||'',
+    phone: lead.phone||'',
+    source: lead.source||'',
+    boardtype: lead.boardType||'',
+    stage: lead.stage||'',
+    quoteamount: String(lead.quoteAmount||''),
+    advancepaid: String(lead.advancePaid||''),
+    balancedue: String(lead.balanceDue||''),
+    followupdate: lead.followUpDate||'',
+    address: lead.address||'',
+    notes: lead.notes||'',
+    locations: lead.locations||[],
+    items: lead.items||[],
+    photos: lead.photos||[],
+    createdat: lead.createdAt||new Date().toISOString(),
+    updatedat: lead.updatedAt||new Date().toISOString(),
+    deleted: false
+  };
+}
+
+function rowToLead(row) {
+  return {
+    id: row.id,
+    name: row.name||'',
+    company: row.company||'',
+    phone: row.phone||'',
+    source: row.source||'',
+    boardType: row.boardtype||'',
+    stage: row.stage||'',
+    quoteAmount: row.quoteamount||'',
+    advancePaid: row.advancepaid||'',
+    balanceDue: row.balancedue||'',
+    followUpDate: row.followupdate||'',
+    address: row.address||'',
+    notes: row.notes||'',
+    locations: row.locations||[],
+    items: row.items||[],
+    photos: row.photos||[],
+    createdAt: row.createdat||new Date().toISOString(),
+    updatedAt: row.updatedat||new Date().toISOString(),
+  };
+}
+
+async function syncFromSupabase() {
+  try {
+    setSyncUI('syncing');
+    const res = await fetch(`${SUPA_URL}/rest/v1/leads?deleted=eq.false&order=updatedat.desc`, {
+      headers: SUPA_HEADERS, cache: 'no-store'
+    });
+    if(!res.ok) throw new Error('Fetch failed: ' + res.status);
+    const rows = await res.json();
+    leads = rows.map(rowToLead);
+    saveSt('ba_crm_leads', leads);
+    setSyncUI('ok');
+    return true;
+  } catch(e) {
+    console.error('Sync from Supabase error:', e);
+    setSyncUI('error');
+    return false;
+  }
+}
+
+async function pushLocalLeadsToSupabase() {
+  // Pehli baar app khulne par, agar local mein purani leads hain jo Supabase mein nahi hain
+  const local = load('ba_crm_leads');
+  if(local.length === 0) return;
+  try {
+    const res = await fetch(`${SUPA_URL}/rest/v1/leads?select=id`, {headers: SUPA_HEADERS});
+    const existing = await res.json();
+    const existingIds = new Set(existing.map(r=>String(r.id)));
+    const toPush = local.filter(l=>!existingIds.has(String(l.id)));
+    for(const lead of toPush) {
+      await syncToSupabase(lead, false);
+    }
+  } catch(e) { console.error('Push error:', e); }
+}
+
+async function syncToSupabase(lead, isDelete) {
+  try {
+    setSyncUI('syncing');
+    if(isDelete) {
+      const res = await fetch(`${SUPA_URL}/rest/v1/leads?id=eq.${encodeURIComponent(lead.id)}`, {
+        method: 'PATCH',
+        headers: SUPA_HEADERS,
+        body: JSON.stringify({deleted: true, updatedat: new Date().toISOString()})
+      });
+      setSyncUI(res.ok ? 'ok' : 'error');
+      return {status: res.ok ? 'ok' : 'error'};
+    } else {
+      const row = leadToRow(lead);
+      // Upsert: try insert, on conflict update
+      const res = await fetch(`${SUPA_URL}/rest/v1/leads`, {
+        method: 'POST',
+        headers: {...SUPA_HEADERS, 'Prefer': 'resolution=merge-duplicates,return=minimal'},
+        body: JSON.stringify(row)
+      });
+      setSyncUI(res.ok ? 'ok' : 'error');
+      return {status: res.ok ? 'ok' : 'error'};
+    }
+  } catch(e) {
+    console.error('Sync to Supabase error:', e);
+    setSyncUI('error');
+    return {status: 'error'};
+  }
+}
+
+async function manualSync() {
+  showToast('☁️ Sync ho raha hai...');
+  const ok = await syncFromSupabase();
+  if(ok) { renderTab(currentTab); updateBadge(); showToast('✅ Sab devices se latest data aa gaya!'); }
+  else { showToast('⚠️ Internet check karo — sync nahi hua'); }
+}
+
+// Override saveLead to sync with Supabase
 async function saveLead() {
-  // Save locally first
   const name=document.getElementById('f-name').value.trim();
   const phone=document.getElementById('f-phone').value.trim();
   if(!name){showToast('❌ Naam daalna zaroori hai!');return;}
@@ -1175,21 +1230,15 @@ async function saveLead() {
   saveSt('ba_crm_leads',leads);
   closeModal();updateBadge();renderTab(currentTab);
   showToast('💾 Saving...');
-  setSyncUI('syncing');
-  // Sync to sheet
-  syncToSheet(lead, false).then(result => {
-    if(result && result.status === 'ok') {
-      showToast('☁️ Sab devices pe save ho gaya!');
-      setSyncUI('ok');
-    } else {
-      showToast('⚠️ Local save hua, Sheet sync baad mein hoga');
-      setSyncUI('error');
-    }
-  });
+  const result = await syncToSupabase(lead, false);
+  if(result.status === 'ok') {
+    showToast('☁️ Sab devices pe save ho gaya!');
+  } else {
+    showToast('⚠️ Local save hua, internet aane par sync hoga');
+  }
 }
 
-// Override deleteLead to also sync
-const _origDeleteLead = deleteLead;
+// Override deleteLead to sync with Supabase
 async function deleteLead(id) {
   if(!confirm('Yeh lead delete karein?'))return;
   const lead = leads.find(l=>l.id===id);
@@ -1197,7 +1246,10 @@ async function deleteLead(id) {
   saveSt('ba_crm_leads',leads);
   closeModal();closePrint();updateBadge();renderTab(currentTab);
   showToast('🗑️ Delete ho gayi! Syncing...');
-  if(lead) syncToSheet(lead, true).then(()=>setSyncUI('ok'));
+  if(lead) {
+    const result = await syncToSupabase(lead, true);
+    if(result.status === 'ok') showToast('☁️ Sab devices se delete ho gayi!');
+  }
 }
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
@@ -1207,12 +1259,12 @@ if(getSess()){
     document.getElementById('hdr-user').textContent='👤 '+u.name;
     leads=load('ba_crm_leads');
     showApp();
-    // Auto sync from sheet on load
     setTimeout(async ()=>{
-      showToast('☁️ Google Sheet se sync ho raha hai...');
-      const ok = await syncFromSheet();
-      if(ok){ renderTab(currentTab); showToast('✅ Data sync ho gaya!'); }
-    }, 1000);
+      showToast('☁️ Sync ho raha hai...');
+      await pushLocalLeadsToSupabase();
+      const ok = await syncFromSupabase();
+      if(ok){ renderTab(currentTab); updateBadge(); showToast('✅ Sab devices ka data sync ho gaya!'); }
+    }, 800);
   }
 }
 </script>
